@@ -1,0 +1,894 @@
+---
+title: "Bike Geometry PCA & Clustering"
+author: "Saf, Tim & Liz"
+date: "2025-09-11"
+output:
+  word_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# MTB Frame Geometry Code
+
+by:
+
+**Saf Flatters, 21827361**
+
+**Timothy Bolt, 21493652**
+
+**Lizanne van Nieuwenhuizen, 21297786**
+
+## Packages
+
+```{r}
+#Install and load packages chunk
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(patchwork)
+library(DataExplorer)
+library(MVN)
+library(corrplot)
+library(psych)
+library(ggbiplot)
+library(grDevices)
+library(devtools)
+library(factoextra)
+library(gridExtra)
+library(clustMixType)
+library(cluster)
+library(ggalluvial)
+# library(plotly) # for 3d plot, not used rn
+```
+
+## Data
+
+### Import
+
+```{r}
+#Import data
+allbikegeo <- read.csv("Data/geometrics.mtb-news.de.csv", sep = ";", stringsAsFactors = FALSE)
+```
+
+### Data Cleaning
+
+#### Dataframe Prep
+
+Cleaned dataframe with numeric-only data and without Year and Suspension: `mtbgeo[, geo_vars]`\
+Cleaned dataframe with all numeric-only data: `mtbgeo[, num_vars]`\
+Cleaned dataframe with mixed data: `mtbgeo`
+
+```{r}
+#Filter to Mountain bikes only
+mtbgeo_only <- subset(allbikegeo, Category == "Mountain")
+
+#Filter to remove 26" wheels
+mtbgeo_only <- subset(mtbgeo_only, !grepl("26", Wheel.Size))
+
+#Convert 0 Year to NA (for later removal)
+mtbgeo_only$Year <- as.integer(mtbgeo_only$Year)
+mtbgeo_only$Year[mtbgeo_only$Year == 0] <- NA
+
+#Replace NA for rear suspension with 0 (assume hardtail)
+mtbgeo_only$Suspension.Travel..rear. <- as.numeric(mtbgeo_only$Suspension.Travel..rear.)
+mtbgeo_only$Suspension.Travel..rear.[is.na(mtbgeo_only$Suspension.Travel..rear.)] <- 0
+
+#Remove rows with NA in 'Suspension.Travel..front.'
+mtbgeo_only$Suspension.Travel..front. <- as.numeric(mtbgeo_only$Suspension.Travel..front.)
+mtbgeo_only <- mtbgeo_only[!is.na(mtbgeo_only$Suspension.Travel..front.), ]
+
+#Drop columns with too many missing values (> 1000)
+keep_cols <- colSums(is.na(mtbgeo_only)) <= 1000
+mtbgeo_reduced <- mtbgeo_only[, keep_cols]
+
+#remove unneeded columns
+mtbgeo_reduced <- mtbgeo_reduced[, !(names(mtbgeo_reduced) %in% c("Frame.Config", "URL", "Category"))]
+
+#Keep only Medium-sized bikes to allow fair comparison of geometry 
+mtbgeo_medium <- mtbgeo_reduced[mtbgeo_reduced$Frame.Size %in% c("M", "Medium"), ]
+
+#remove all rows that have any NA's in numeric/integer columns
+num_cols <- sapply(mtbgeo_medium, function(x) is.numeric(x) || is.integer(x))
+vars_to_check <- names(mtbgeo_medium)[num_cols]
+mtbgeo_clean <- mtbgeo_medium[complete.cases(mtbgeo_medium[, vars_to_check]),]
+
+#rename dataframe and check
+mtbgeo <- mtbgeo_clean
+# str(mtbgeo)
+# anyNA(mtbgeo)
+
+#Create numeric only dataframe
+num_vars <- sapply(mtbgeo, is.numeric)
+# str(mtbgeo[, num_vars])
+
+#Create numeric only without suspension and Year vars dataframe
+drop_vars <- c("Year", "Suspension.Travel..rear.", "Suspension.Travel..front.")
+geo_vars <- sapply(mtbgeo, is.numeric) & !(names(mtbgeo) %in% drop_vars)
+str(mtbgeo[, geo_vars])
+```
+
+#### Standardisation
+
+```{r}
+mtbgeo_zscores <- mtbgeo   #make copy
+mtbgeo_zscores[, geo_vars] <- scale(mtbgeo_zscores[, geo_vars]) #standardise geo_vars
+str(mtbgeo_zscores)
+```
+
+### Category Psuedo-labels (Y)
+
+```{r}
+# make y label groups for validation ("Cross-country", "Trail", "Enduro",  "Downhill")
+mtbgeo_groups <- mtbgeo %>%
+  mutate(
+    Category = case_when(
+      # Downhill: both ends ≥ 180 (must have rear)
+      !is.na(Suspension.Travel..rear.) &
+        Suspension.Travel..front. >= 180 & Suspension.Travel..rear. >= 180 ~ "Downhill",
+
+      # Enduro: rear 150–180 AND front 140–190 (must have rear)
+      !is.na(Suspension.Travel..rear.) &
+        Suspension.Travel..rear. >= 145 & Suspension.Travel..rear. <= 180 &
+        Suspension.Travel..front. >= 140 & Suspension.Travel..front. <= 190 ~ "Enduro",
+
+      # Cross-country: front 100–120 AND (no rear OR rear ≤ 120)
+      Suspension.Travel..front. >= 100 & Suspension.Travel..front. <= 120 &
+        (is.na(Suspension.Travel..rear.) | Suspension.Travel..rear. <= 130) ~ "Cross-country",
+
+      # Trail: front 121–160 AND rear ≤ 150 (must have rear)
+      !is.na(Suspension.Travel..rear.) &
+        Suspension.Travel..front. >= 121 & Suspension.Travel..front. <= 160 &
+        Suspension.Travel..rear. <= 150 ~ "Trail",
+
+      TRUE ~ "Other"
+    )
+  )
+
+# order
+mtbgeo_groups$Category <- factor(mtbgeo_groups$Category, levels = c("Cross-country", "Trail", "Enduro",  "Downhill"))
+
+# Count bikes in each group
+mtbgeo_groups %>%
+  count(Category)
+
+
+```
+
+```{r}
+# View(mtbgeo_groups[mtbgeo_groups$Category == "Other", ])
+```
+
+```{r}
+# Count bikes per category
+cat_counts <- mtbgeo_groups %>%
+  count(Category)
+
+pal_geo <- c("Downhill"="purple",
+          "Enduro"="mediumturquoise",
+          "Trail"="yellowgreen",
+          "Cross-country"="#F8766D")
+
+# Plot number bikes per category
+ggplot(cat_counts, aes(x = Category, y = n, fill = Category)) +
+  geom_col(width = 0.7) +
+  geom_text(aes(label = n), vjust = -0.4, size = 4) +
+  scale_fill_manual(values = pal_geo, guide = "none") +
+  labs(
+    title = "Number of Bikes per Category",
+    x = "Category",
+    y = "Count of Bikes"
+  ) +
+  theme_classic(base_size = 13) +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold", hjust = 0.5)
+  )
+```
+
+## Exploration & Assumption Checks
+
+#### Outliers
+
+Due to the data being datascraped from the internet, we suspected it may have outliers that aren't true outliers but more like data entry mistakes.
+
+```{r}
+outlier_rows <- apply(abs(mtbgeo_zscores[, geo_vars]), 1, max) > 7  # Flag rows where any geometry z-score exceeds our threshold 
+print(mtbgeo[outlier_rows, ])    # View the outliers (without standardised values)
+# View((mtbgeo[outlier_rows, ]))
+```
+
+```{r}
+# remove above observations 
+mtbgeo <- mtbgeo[!outlier_rows, ]
+mtbgeo_zscores <- mtbgeo_zscores[!outlier_rows, ]
+mtbgeo_groups <- mtbgeo_groups[!outlier_rows, ]
+
+nrow(mtbgeo)
+nrow(mtbgeo_groups)
+```
+
+```{r}
+Matrix_mtbgeo_z <- as.matrix(mtbgeo_zscores[, geo_vars])
+# mvn(Matrix_mtbgeo_z, mvn_test = "royston", univariate_test = "AD") #or mvn_test = "hz" or "royston" or 
+multivariate_diagnostic_plot(Matrix_mtbgeo_z)
+univariate_diagnostic_plot(Matrix_mtbgeo_z, type = "boxplot")
+```
+
+```{r}
+# Check for outliers shown with mahalanobis and remove outlier (2022 Lapace Prorace)
+md <- mahalanobis(Matrix_mtbgeo_z,
+                  center = colMeans(Matrix_mtbgeo_z),
+                  cov = cov(Matrix_mtbgeo_z))
+sqrt(max(md))
+maxmala <- which.max(md)
+mtbgeo[which.max(md), ]
+
+mtbgeo <- mtbgeo[-maxmala, ]  # remove above observation
+mtbgeo_zscores <- mtbgeo_zscores[-maxmala, ]  # remove above observation
+mtbgeo_groups <- mtbgeo_groups[-maxmala, ]  # remove above observation
+```
+
+```{r}
+# column means
+(colMeans(mtbgeo[, geo_vars]))
+# (View(cov(mtbgeo[, geo_vars])))
+ 
+```
+
+This was moved to after outliers were removed as it wasn't a good representation of the data
+
+```{r}
+# Check distributions of each variable 
+vars <- c(names(mtbgeo)[geo_vars], 
+          "Suspension.Travel..rear.", 
+          "Suspension.Travel..front.")
+
+df_long <- mtbgeo[, vars] |>
+  pivot_longer(everything(), names_to = "var", values_to = "val") # Long format for faceting
+
+n_geo <- length(geo_vars)
+pal_geo <- grDevices::hcl.colors(n_geo, palette = "viridis")
+pal_susp <- grDevices::hcl.colors(2, palette = "reds") 
+pal <- c(pal_geo, pal_susp)
+
+ggplot(df_long, aes(x = val, fill = var)) +
+  geom_density(alpha = 0.7) +
+  facet_wrap(~ var, scales = "free", ncol = 3) +
+  scale_fill_manual(values = pal, guide = "none") +
+  labs(title = "Distribution of Geometry Variables + Suspension", 
+       x = "Geometry Variables", 
+       y = "Density") +
+  theme_classic() +
+  theme(
+    plot.title = element_text(hjust = 0.5, color = "slateblue4", size = 16),
+    axis.title.x = element_text(size = 14),
+    axis.title.y = element_text(size = 14)
+  )
+```
+
+#### Correlation
+
+```{r}
+# Correlation matrix
+Matrix_mtbgeo <- as.matrix(mtbgeo[, geo_vars])
+round(cor(Matrix_mtbgeo), 4)
+```
+
+```{r}
+# Correlation plot
+corrplot(cor(Matrix_mtbgeo), method = "color", type = "upper",
+         tl.col = "black", tl.srt = 45, addCoef.col = "black",
+         number.cex = 0.6)  # correlation heatmap
+```
+
+```{r}
+# Use MSA to check suitable correlations for PCA (see report PCA references)
+cortest.bartlett(cor(mtbgeo[, geo_vars]), n = nrow(mtbgeo[, geo_vars]))
+KMO(cor(mtbgeo[, geo_vars]))
+```
+
+```{r}
+# remove weak MSA variables < 0.4
+weak_vars <- c("Chainstay.Length", "STR", "Stack")
+
+# check correlation and MSA of strong MSA variables < 0.48
+strong_vars <- sapply(mtbgeo, is.numeric) & 
+               !(names(mtbgeo) %in% c("Year", 
+                                      "Suspension.Travel..rear.", 
+                                      "Suspension.Travel..front.",
+                                      weak_vars))
+KMO(cor(mtbgeo[, strong_vars]))
+
+Matrix_mtbstrong <- as.matrix(mtbgeo[, strong_vars])
+corrplot(cor(Matrix_mtbstrong), method = "color", type = "upper",
+         tl.col = "black", tl.srt = 45, addCoef.col = "black",
+         number.cex = 0.6)  # correlation heatmap
+
+mtbgeo[strong_vars]
+```
+
+#### Linearity
+
+```{r}
+# outputs a PDF to file of scatterplots of all combinations of variables to check linearity
+vars <- names(mtbgeo)[strong_vars]          
+pdf("scatterpairs_all.pdf", width = 6, height = 5)
+
+# loop over all pairs
+cmb <- combn(vars, 2, simplify = FALSE)
+for (xy in cmb) {
+  x <- xy[1]; y <- xy[2]
+  plot(mtbgeo[[x]], mtbgeo[[y]],
+       xlab = x, ylab = y, pch = 20, col = "grey40",
+       main = paste(y, "vs", x))
+  abline(lm(mtbgeo[[y]] ~ mtbgeo[[x]]), lty = 2, col = "black")  # visual linear fit
+}
+dev.off()
+```
+
+## Principal Component Analysis
+
+```{r}
+# Perform PCA: 
+pca <- princomp(mtbgeo[, strong_vars], #PCA
+                  cor = TRUE)
+pca$loadings
+summary(pca)                 # Std. dev, Proportion of Var, Cumulative Var
+
+eigvals <- pca$sdev^2        # eigenvalues λ_i
+eigvals
+```
+
+### Component Selection
+
+```{r}
+# Select n components
+pve <- eigvals / sum(eigvals)  # proportion of total variance
+round(cbind(Eigenvalue = eigvals,
+            Proportion = pve,
+            CumProp = cumsum(pve)), 3)
+
+plot(pca, type = "l", main = "Scree Plot of Principal Components")
+
+## Bar scree (optional) + Kaiser line at 1 (on correlation, λ=1 rule)
+barplot(eigvals, names.arg = paste0("PC", seq_along(eigvals)),
+        main = "Eigenvalues (Bar Scree)", ylab = "Eigenvalue")
+abline(h = 1, col = 2, lty = 2)
+```
+
+```{r}
+summary(pca)
+```
+
+```{r}
+loadings <- pca$loadings      
+print(loadings) 
+```
+
+```{r}
+K <- which(cumsum(pve) >= 0.80)[1]   # first K with ≥80% cumulative variance
+K
+```
+
+```{r}
+# pca scores for each bike
+id_cols <- c("Brand", "Model", "Year")  
+scores_df <- cbind(
+  mtbgeo[, intersect(id_cols, names(mtbgeo)), drop = FALSE],
+  as.data.frame(pca$scores)  
+)
+
+head(scores_df)
+```
+
+#### PCA Biplot
+
+```{r}
+# Biplot using pseudo-labelled colours with 50% probability ellipses, showing variable orthogonality
+mtbgeo_groups$Category <- factor(mtbgeo_groups$Category, levels = c("Cross-country", "Trail", "Enduro",  "Downhill"))
+
+ggbiplot(pca,
+              obs.scale = 2,
+              var.scale = 2,
+              point.size = 1.2,
+          varname.adjust = 2,
+              groups = mtbgeo_groups$Category,
+              ellipse = TRUE,
+             ellipse.linewidth = 0.2,
+              circle = FALSE,
+              ellipse.prob = .5) + 
+    theme_classic() +
+    labs(title = "PCA biplot with bike categories (50% probability ellipses)") + 
+  theme(legend.direction = 'horizontal',
+               legend.position = 'top')
+```
+
+## Clustering (K means)
+
+#### Choosing k
+
+```{r}
+# put the pca scores into a dataframe
+clustering_data <- as.data.frame(pca$scores)
+colnames(clustering_data) <- c("PC1", "PC2", "PC3", "PC4")
+clustering_sub2 <- clustering_data[ , 1:2]
+clustering_sub3 <- clustering_data[ , 1:3]
+clustering_sub4 <- clustering_data[ , 1:4]
+
+# do some sort of test to figure out what k should be 
+set.seed(123)
+( sub2_p1 <- fviz_nbclust(clustering_sub2, kmeans, method = "wss") )
+( sub2_p2 <- fviz_nbclust(clustering_sub2, kmeans, method = "silhouette") )
+( sub2_p3 <- fviz_nbclust(clustering_sub2, kmeans, method = "gap_stat") )
+
+# fviz_nbclust(clustering_sub3, kmeans, method = "wss")
+# fviz_nbclust(clustering_sub4, kmeans, method = "wss")
+
+grid.arrange(grobs = c(sub2_p1, sub2_p2), ncol=2)
+
+#Anything from 3 to 6 clusters is optimal. I will do clustering and print plots with 3, 4, 5 and 6 clusters and then see which one looks best.
+
+```
+
+
+#### Clusters
+
+```{r}
+# Check to see what data looks like before being clustered, guess what points would realistically be grouped together
+plot(clustering_sub2$PC1, clustering_sub2$PC2)
+```
+
+```{r}
+obs_kclusts <- function(k, clust_data) {
+  kmTest <- kmeans(clust_data, centers=k, nstart = 20)
+  ratio <- kmTest$betweenss/kmTest$totss
+  print(paste("ratio for",k,"clusters:", ratio))
+  return(kmTest)
+}
+
+print_kclusts <- function(kmTest, clust_data) {
+  plot_k <- fviz_cluster(kmTest, geom = "point", data = clust_data, choose.vars = c("PC1", "PC2")) + 
+  ggtitle(paste("k =", k)) + theme_minimal()
+  plot_k
+}
+```
+
+```{r}
+clustering_data <- clustering_sub2
+
+n <- 7  # max number of clusters to test
+results <- list()
+
+for (k in 2:n) {
+  results[[paste0("k", k)]] <- obs_kclusts(k, clustering_data)
+}
+
+lapply(results, print_kclusts, clustering_data)
+
+plots <- list()
+for (k in 2:n) {
+  kmTest <- kmeans(clustering_sub2, centers = k, nstart = 20)
+  plots[[paste0("k", k)]] <- fviz_cluster(kmTest, geom = "point", data = clustering_sub2, choose.vars = c("PC1", "PC2")) + ggtitle(paste("k =", k))
+}
+
+ktest <- kmeans(clustering_sub2, centers = 2, nstart = 20)
+fviz_cluster(ktest, geom = "point", data = clustering_sub2, choose.vars = c("PC1", "PC2")) + ggtitle("k = 3") + theme_classic()
+
+grid.arrange(grobs = plots, ncol = 3)
+```
+
+### Sankey and Confusion charts
+
+```{r}
+bike_confusion_table <- function(data, cluster_data) {
+  data_clone <- data
+  data_clone$cluster  <- factor(cluster_data$cluster)
+  data_clone$Category <- factor(mtbgeo_groups$Category, levels = c("Cross-country", "Trail", "Enduro",  "Downhill"))
+  
+  # confusion-style table
+  tab <- table(Cluster = data_clone$cluster, Category = data_clone$Category)
+  prop.table(tab, 1)  # row %: composition of each cluster
+  
+  return(tab)
+}
+
+bike_sankey <- function(table, plot_title) {
+  df_alluv <- as.data.frame(table) %>% as_tibble()
+  ggplot(df_alluv, aes(axis1 = Category, axis2 = Cluster, y = Freq)) +
+    geom_alluvium(aes(fill = Category), width = 0.1, alpha = 0.6) +
+    geom_stratum(aes(fill = Category), width = 0.05, alpha=0.3) +
+    # scale_fill_brewer(palette = "Dark2", name = "Category") +
+    geom_text(stat = "stratum", aes(label = after_stat(stratum)), hjust = 0, nudge_x = 0.03) +
+    labs(title = plot_title, y = "", subtitle = "Flow Weight =  No. of Bikes") +
+    theme_void() + theme(axis.text.y  = element_blank(), axis.text.x  = element_blank()) 
+}
+```
+
+```{r}
+(table1 <- bike_confusion_table(clustering_data, results$k6))
+prop.table(table1, 1)
+bike_sankey(table1, "Bike Category → 6 k-means Clusters")
+```
+
+####3D plot
+
+```{r}
+# # This is for the wrong clusters atm, k4 is for 2 PCs but is being plotted for sub3 (3 PCs)
+# 
+# plot_ly(data = clustering_sub3, x = ~PC1, y = ~PC2, z = ~PC3, color = ~factor(k4$cluster),
+#   colors = c("#E41A1C", "#377EB8", "#4DAF4A"), type = "scatter3d", mode = "markers") %>%
+#   layout(title = "3D PCA space - k = 3 clusters")
+```
+
+
+## Mixed clustering
+
+### Mixed dataframe creation
+
+```{r}
+# mixed_df: data.frame with numeric columns and categorical columns as factors
+# id_cols <- c("Brand", "Model", "Year", "Motorized", "Wheel.Size") # all categorical columns in mtbgeo
+
+id_cols <- c("Brand", "Year", "Motorized", "Wheel.Size") # subset of categories from industry expert
+
+mixed_df <- cbind(
+  mtbgeo[, intersect(id_cols, names(mtbgeo)), drop = FALSE], 
+  as.data.frame(mtbgeo[, strong_vars])  # use subset of strong vars -> don't need to use standaridised ones
+)
+# head(mixed_df)
+
+# mixed_df$Brand = as.factor(mixed_df$Brand) # need to turn these categorical variables into clusters
+# mixed_df$Model = as.factor(mixed_df$Model)
+# mixed_df$Motorized = as.factor(mixed_df$Motorized)
+# mixed_df$Year = as.factor(mixed_df$Year)
+# mixed_df$Wheel.Size = as.factor(mixed_df$Wheel.Size)
+
+# Ensure types are correct
+mixed_df[] <- lapply(mixed_df, function(x) if (is.character(x)) factor(x) else x)
+mixed_df$Year = as.factor(mixed_df$Year)
+
+head(mixed_df)
+```
+
+###Finding optimal k for mixed
+
+```{r}
+fit_kproto <- function(k, df, nstart, d_gower) {
+  fit <- suppressMessages(suppressWarnings( kproto(df, k = k, nstart = nstart) ))
+  sil_mean <- NA
+  if(!is.null(d_gower) && k > 1) {
+    sil_mean <- silhouette(as.integer(fit$cluster), d_gower)[,3]
+  }
+  fit_df <- data.frame(k = k, tot_withinss = fit$tot.withinss, # k-prototypes TWSS (lower is better)
+                   lambda = fit$lambda, # balance used
+                   sil_mean = sil_mean) 
+  return(fit_df)
+}
+
+kproto_sweep <- function(df, k_range, nstart = 20, seed = 123, do_silhouette = TRUE) {
+  set.seed(seed)
+  d_gower <- NULL 
+  if (do_silhouette) {
+    d_gower <- daisy(df, metric = "gower") # Compute Gower for silhouettes (optional)
+  }  
+  
+  k_sweep <- lapply(k_range, fit_kproto, df = df, nstart = nstart, d_gower = d_gower)
+  df_out <- bind_rows(k_sweep) # “Explained dissimilarity” relative to k=1
+  
+  df_out <- df_out %>%
+  mutate(tot_withinss_k1 = first(tot_withinss),
+         explained = 1 - (tot_withinss / tot_withinss_k1))
+  
+  return(df_out)
+}
+```
+
+```{r}
+plot_mixed_elbow <- function(mixed_sweep) { # Elbow plot for k-prototypes
+  ggplot(mixed_sweep, aes(k, tot_withinss)) +
+  geom_line(color="steelblue") + geom_point(color="steelblue") + theme_classic() +
+  scale_x_continuous(breaks = 1:10) +
+  labs(title = "k-prototypes elbow (total within-cluster dissimilarity)",
+       x = "k", y = "Total withinss (lower is better)")
+}
+
+plot_mixed_exp_diss <- function(mixed_sweep) { # explained dissimilarity in % (relative to k=1)
+  ggplot(sweep_df, aes(k, explained)) +
+  geom_line(color="steelblue") + geom_point(color="steelblue") + theme_classic() +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(title = "Explained dissimilarity vs k",
+       x = "k", y = "Explained dissimilarity")
+}
+
+# Optional: silhouette (using Gower) to corroborate elbow
+plot_mixed_silhouette <- function(mixed_sweep) {
+  ggplot(filter(mixed_sweep, k > 1), aes(k, sil_mean)) +
+  geom_line(color="steelblue") + geom_point(color="steelblue") + theme_classic() +
+  labs(title = "Average silhouette vs k (Gower distance)",
+       x = "k", y = "Average silhouette")
+}
+
+```
+
+
+```{r}
+# Run the sweep 
+ks <- 1:10
+sweep_df <- kproto_sweep(mixed_df, k_range = ks, do_silhouette = TRUE)
+
+p1 <- plot_mixed_elbow(sweep_df)
+p2 <- plot_mixed_exp_diss(sweep_df)
+p3 <- plot_mixed_silhouette(sweep_df)
+
+p1
+p2
+
+# grid.arrange(grobs = c(p1,p2,p3), ncol = 3)
+```
+
+###Optimal k for mixed
+
+```{r}
+# k-prototypes (handles mixed types)
+set.seed(123)
+
+kmix3 <- kproto(mixed_df, k = 3, lambda = NULL, nstart = 20)
+kmix4 <- kproto(mixed_df, k = 4, lambda = NULL, nstart = 20)
+kmix6 <- kproto(mixed_df, k = 6, lambda = NULL, nstart = 20)
+# lambda = NULL => auto-estimated balance between numeric and categorical parts
+
+# kmix$centers           # data frame: numeric columns are means; factors are modes
+# kmix$lambda            # numeric↔categorical balance used
+# kmix$size              # cluster sizes
+# kmix$withinss          # within-cluster dissimilarity per cluster
+# kmix$tot.withinss      # total within-cluster dissimilarity
+# summary(kmix)
+
+kmix3
+```
+
+### Plotting optimal ks for mixed
+
+```{r}
+kmix <- kmix3
+# kmix <- kmix4
+# kmix <- kmix6
+
+mixed_plots <- clustMixType::clprofiles(kmix, mixed_df)
+
+mixed_with_pc <- mixed_df
+mixed_with_pc$PC1 <- pca$scores[,"Comp.1"]
+mixed_with_pc$PC2 <- pca$scores[,"Comp.2"]
+mixed_with_pc$Category <- factor(mtbgeo_groups$Category, levels = c("Cross-country", "Trail", "Enduro",  "Downhill"))
+mixed_with_pc$kproto <- factor(kmix$cluster)
+
+mixed_with_pc$kmeans <- factor(results$k3$cluster)
+# mixed_with_pc$kmeans <- factor(results$k4$cluster)
+# mixed_with_pc$kmeans <- factor(results$k6$cluster)
+```
+
+```{r}
+plot_df <- data.frame(x = mixed_df[,"Reach"], 
+                      y = mixed_df[,"Wheelbase"], 
+                      cluster = factor(kmix$cluster))
+
+ggplot(plot_df, aes(x, y, color = cluster)) +
+  geom_point(alpha = 0.8) +
+  labs(title = "k-prototypes clusters on Reach vs Wheelbase", x = "Reach", y = "Wheelbase") +
+    stat_ellipse(aes(fill = cluster, group = cluster), type = "norm", geom = "polygon", level = 0.9, linewidth = 0.8, alpha = 0.25) +
+  theme_classic()
+```
+
+```{r}
+# p_kproto <- ggplot(mixed_with_pc, aes(PC1, PC2, color = factor(kmix$cluster), shape = Category)) +
+p_kproto <- ggplot(mixed_with_pc, aes(PC1, PC2, color = kproto)) +
+  geom_point(alpha = 0.8) +
+  # scale_shape_manual(values = c(16, 17, 15, 3)) +
+  stat_ellipse(aes(fill = kproto, group = kproto), type = "norm", geom = "polygon", level = 0.9, linewidth = 0.8, alpha = 0.25) +
+  labs(title = "k-prototypes clusters on PC map: k = 6", color = "kproto") +
+  theme_classic()
+# 
+# p_kmeans <- ggplot(mixed_with_pc, aes(PC1, PC2, color = kmeans)) +
+#   geom_point(alpha = 0.8) +
+#   stat_ellipse(aes(fill = kmeans, group = kmeans), type = "norm", geom = "polygon", level = 0.9, linewidth = 0.8, alpha = 0.25) +
+#   labs(title = "k-means clusters on PC map", color = "kmeans") +
+#   theme_classic()
+
+# ggplot(mixed_with_pc, aes(PC1, PC2)) +
+#   geom_point(aes(color = kproto), alpha = 0.75, size = 1.8) +
+#   stat_ellipse(aes(color = kproto, group = kproto), type = "norm", level = 0.90, linetype = 1) +
+#   stat_ellipse(aes(color = kmeans, group = kmeans), type = "norm", level = 0.90, linetype = 2) +
+#   labs(title = "Ellipses: k-prototypes (solid) vs k-means (dashed)",
+#        color = "Cluster") +
+#   theme_minimal()
+
+p_kproto
+# p_kmeans
+```
+
+```{r}
+mixed_table <- bike_confusion_table(mixed_df, kmix)
+mixed_table
+bike_sankey(mixed_table, "Bike Category → 3 k-prototypes Clusters")
+```
+
+------------------------------------------------------------------------
+
+# SVM - extra marks
+
+## Packages for SVM
+
+```{r}
+# SVM: multi-class classification on numeric geometry-only features 
+
+# Extra packages required for this SVM section
+library(e1071)
+library(caret)
+library(lattice)
+
+```
+
+## Dataframe with labels
+
+```{r}
+set.seed(1234)
+
+# Build labelled data frame: X = geometry vars only, y = Category from mtbgeo_groups
+feature_names <- names(mtbgeo)[geo_vars]
+svm_df <- mtbgeo[, feature_names, drop = FALSE] %>%
+  mutate(Category = factor(mtbgeo_groups$Category))
+```
+
+## Split into Train/Test
+
+```{r}
+# Stratified train/test split as classes are imbalanced and we need them all represented in train and test sets
+idx <- caret::createDataPartition(svm_df$Category, p = 0.7, list = FALSE)
+train <- svm_df[idx, ]
+test  <- svm_df[-idx, ]
+
+```
+
+## Add class weights
+
+```{r}
+# Compute class weights to address imbalance (median frequency scaling)
+freq <- table(train$Category)
+class_wts <- as.numeric(median(freq) / freq)
+names(class_wts) <- names(freq)
+freq
+```
+
+## Hyperparameter tuning for Gamma and Cost
+
+```{r}
+# Hyperparameter tuning (radial kernel)
+gamma_grid <- 2^(-9:-1)     # reasonable range for gamma (RBF width)
+cost_grid  <- 2^(-1:9)      # reasonable range for C (regularisation)
+
+# try every (C, gamma) pair on 5 fold CV on training data
+tuned <- e1071::tune.svm(
+  x = train[, feature_names],
+  y = train$Category,
+  kernel = "radial",
+  gamma = gamma_grid,
+  cost  = cost_grid,
+  class.weights = class_wts,
+  scale = TRUE,                          # safe standardisation inside svm
+  tunecontrol = tune.control(cross = 5)  # 5-fold CV
+)
+
+# note to team: this will take a bit to find best
+
+best <- tuned$best.model  # gets best (C, gamma) found by CV
+best
+
+best$cost; best$gamma      # confirm what's in the final model
+```
+
+## Get Predictions
+
+```{r}
+# Test-set predictions
+pred <- predict(best, newdata = test[, feature_names])
+```
+
+## Validation visualisations
+
+### Confusion Matrix
+
+```{r}
+# Confusion matrix
+cm <- caret::confusionMatrix(pred, test$Category)
+cm
+```
+
+### Accuracy scores
+
+```{r}
+# Per-class precision/recall/F1
+per_class_metrics <- {
+  lev <- levels(test$Category)
+  res <- lapply(lev, function(l) {
+    tp <- sum(test$Category == l & pred == l)
+    fp <- sum(test$Category != l & pred == l)
+    fn <- sum(test$Category == l & pred != l)
+
+    precision <- ifelse(tp + fp == 0, NA, tp / (tp + fp))
+    recall    <- ifelse(tp + fn == 0, NA, tp / (tp + fn))
+    f1        <- ifelse(
+      is.na(precision) | is.na(recall) | precision + recall == 0,
+      NA,
+      2 * precision * recall / (precision + recall)
+    )
+
+    data.frame(class = l, precision, recall, f1)
+  })
+  do.call(rbind, res)
+}
+
+accuracy <- mean(pred == test$Category)
+print(per_class_metrics)
+
+
+```
+
+### Confusion Heatmap
+
+```{r}
+# Confusion heatmap
+cm_df <- as.data.frame(table(Truth = test$Category, Pred = pred))
+ggplot(cm_df, aes(x = Pred, y = Truth, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq), size = 4) +
+  labs(title = "SVM confusion matrix (test set)", x = "Predicted", y = "True") +
+  theme_classic(base_size = 13) +
+  scale_fill_gradient(name = "Count", low = "grey95", high = "steelblue4")
+
+```
+
+### Decision Regions in PCA space
+
+```{r}
+# PCA on train dataset only
+Xtr <- train[, feature_names]
+pcs <- princomp(Xtr, cor = TRUE, scores = FALSE)
+
+# 2 = k PCs (This is just for plotting so no need to align with actual PCA and we just train SVM on the first two)
+var_expl <- pcs$sdev^2 / sum(pcs$sdev^2)
+k <- 2
+
+# project train/test to PC space
+train_scores <- as.data.frame(predict(pcs, newdata = Xtr)[, 1:k])
+test_scores  <- as.data.frame(predict(pcs, newdata = test[, feature_names])[, 1:k])
+train_scores$Category <- train$Category
+test_scores$Category  <- test$Category
+
+# Train SVM on PC1, PC2
+svm_pca <- e1071::svm(Category ~ ., data = {
+  sc <- as.data.frame(predict(pcs, Xtr)[, 1:2])
+  sc$Category <- train$Category
+  sc
+}, kernel = "radial", gamma = best$gamma, cost = best$cost,
+   class.weights = class_wts, scale = TRUE)
+
+# Decision regions grid
+ts2 <- as.data.frame(predict(pcs, test[, feature_names])[, 1:2])
+names(ts2) <- c("Comp.1","Comp.2")
+rng1 <- range(ts2$Comp.1); rng2 <- range(ts2$Comp.2)
+grid <- expand.grid(`Comp.1` = seq(rng1[1], rng1[2], length.out = 200),
+                    `Comp.2` = seq(rng2[1], rng2[2], length.out = 200))
+grid$pred <- predict(svm_pca, grid)
+
+ggplot() +
+  geom_raster(data = grid, aes(`Comp.1`, `Comp.2`, fill = pred), alpha = 0.25) +
+  geom_point(data = transform(ts2, Category = test$Category),
+             aes(`Comp.1`, `Comp.2`, colour = Category), size = 1.8) +
+  labs(title = "SVM decision regions in PCA space") +
+  theme_classic(base_size = 13) +
+  guides(fill = "none")
+
+```
