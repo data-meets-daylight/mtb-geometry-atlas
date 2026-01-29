@@ -45,10 +45,6 @@ This project explores whether medium‑size mountain bikes can be grouped by geo
     
     - Ensure the MTB geometry CSV exists at `Data/geometrics.mtb-news.de.csv` (semicolon‑separated). If missing, obtain it from the original geometry dataset and place it under `Data/`.
 
-## Supporting Documents
-Code folder: For R code and Data
-Presentation folder: Powerpoint and Presentation video about our findings (for non-technical audiences)
-Report folder: Report on methods and findings 
         
 ## Credits
 Saf Flatters · Timothy Bolt · Lizanne van Nieuwenhuizen
