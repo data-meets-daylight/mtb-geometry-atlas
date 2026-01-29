@@ -1,0 +1,14 @@
+# Videos / big files
+*.mp4
+*.mov
+*.mkv
+
+# R / RStudio
+.Rhistory
+.RData
+.Rproj.user/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
