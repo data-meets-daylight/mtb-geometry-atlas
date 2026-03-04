@@ -45,6 +45,25 @@ This project explores whether medium‑size mountain bikes can be grouped by geo
     
     - Ensure the MTB geometry CSV exists at `Data/geometrics.mtb-news.de.csv` (semicolon‑separated). If missing, obtain it from the original geometry dataset and place it under `Data/`.
 
+
+## Visualisation of Results
+
+#### Variable Distributions Plot
+![alt text](<Plots/Geo-Distribution.png>)
+
+#### PCA
+![alt text](<Plots/Geo-Biplot.png>)
+
+#### K-Means Clustering & Validation
+![alt text](<Plots/Geo-Kmeans6.png>)  
+
+![alt text](<Plots/Geo-Kmeans6Sankey.png>)
+
+#### K-Prototypes Clustering & Validation
+![alt text](<Plots/Geo-Kproto3.png>)  
+
+![alt text](<Plots/Geo-Kproto3Sankey.png>)
+
         
 ## Credits
 Saf Flatters · Timothy Bolt · Lizanne van Nieuwenhuizen
